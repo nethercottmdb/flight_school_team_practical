@@ -10,7 +10,7 @@ dbutils.widgets.dropdown("reset_all_data", "false", ["true", "false"], "Reset al
 # DBTITLE 1,How to implement and run this notebook
 #When possible, always use one of the SHARED-XXX cluster available
 #Tips: the %run cell defined above init a database with your name, and Python path variable is available, use it to store intermediate data or your checkpoints
-#You need to run the setup cell to have these variable defined:
+#You need to run the setup cell to have these variable defined
 print(f"path={path}")
 #Just save create the database to the current database, it's been initiliazed locally to your user to avoid conflict
 print("your current database has been initialized to:")
@@ -49,19 +49,22 @@ display_slide('137acXM8aj9dJUZbLpH3ZIorKHzBx3B0wqPRm-qdQ-yU', 39)  #hide this co
 
 # COMMAND ----------
 
-Our raw data is made available as files in a bucket mounted under /mnt/field-demos/manufacturing/iot_turbine/incoming-data-json
-TODO: Use %fs to visualize the incoming data under /mnt/field-demos/manufacturing/iot_turbine/incoming-data-json
+# MAGIC %fs ls /mnt/field-demos/manufacturing/iot_turbine/incoming-data-json
 
 # COMMAND ----------
 
 # MAGIC %sql
 # MAGIC --TODO : Select and display the entire incoming json data using a simple SQL:
-# MAGIC SELECT * FROM json.`/your/location/xxx`
+# MAGIC SELECT * FROM json.`/mnt/field-demos/manufacturing/iot_turbine/incoming-data-json`
 # MAGIC 
 # MAGIC -- What you have here is a list of IOT sensor metrics (AN1,AN2...) that you get from your turbine (vibration, speed...).
 # MAGIC -- We'll then ingest these metrics and use them to detect when a turbine isn't healthy, so that we can prevent outage. 
 # MAGIC 
 # MAGIC -- TODO: take some time to understand the data, and keep it super simple (you can choose what AN1/2/3 represent for megacorp).
+
+# COMMAND ----------
+
+
 
 # COMMAND ----------
 
@@ -94,10 +97,39 @@ TODO: Use %fs to visualize the incoming data under /mnt/field-demos/manufacturin
 
 # COMMAND ----------
 
+def autoload_to_table(data_source, source_format, table_name, checkpoint_directory):
+    query = (spark.readStream
+                  .format("cloudFiles")
+                  .option("cloudFiles.format", source_format)
+                  .option("cloudFiles.schemaLocation", checkpoint_directory)
+                  .option("cloudFiles.inferColumnTypes", "true")
+                  .option("cloudFiles.maxFilesPerTrigger", 1)
+                  .load(data_source)
+                  .writeStream
+                  .trigger(processingTime='10 seconds')
+                  .option("checkpointLocation", checkpoint_directory)
+                  .option("mergeSchema", "true")
+                  .table(table_name))
+    return query
+  
+autoload_to_table(data_source = "dbfs:/mnt/field-demos/manufacturing/iot_turbine/incoming-data-json",
+                          source_format = "json",
+                          table_name = "flightschool_max_nethercott.turbine_bronze",
+                          checkpoint_directory = path+"/bronze_checkpoint")
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC DESCRIBE HISTORY turbine_bronze
+
+# COMMAND ----------
+
 # DBTITLE 1,Our raw data is now available in a Delta table
 # MAGIC %sql
 # MAGIC -- you should have a bronze table structured with the following columns: ID AN3 AN4 AN5 AN6 AN7 AN8 AN9 AN10 SPEED TORQUE _rescued
 # MAGIC -- TODO: run a SELECT from your turbine_bronze
+# MAGIC 
+# MAGIC select * from turbine_bronze
 
 # COMMAND ----------
 
@@ -105,7 +137,12 @@ TODO: Use %fs to visualize the incoming data under /mnt/field-demos/manufacturin
 # MAGIC %sql
 # MAGIC -- TODO: which table property should you define to solve small files issue ? What's the typical challenge running streaming operation? And the value for your customer.
 # MAGIC -- Documentation: https://docs.databricks.com/delta/optimizations/auto-optimize.html
-# MAGIC -- ALTER TABLE ....
+# MAGIC ALTER TABLE flightschool_max_nethercott.turbine_bronze SET TBLPROPERTIES (delta.autoOptimize.optimizeWrite = true, spark.databricks.delta.autoCompact.enabled = true)
+
+# COMMAND ----------
+
+# MAGIC %python
+# MAGIC #dbutils.fs.ls("dbfs:/Users/max.nethercott@databricks.com/field_demos/flightschool/tables/turbine_bronze")
 
 # COMMAND ----------
 
@@ -117,18 +154,28 @@ TODO: Use %fs to visualize the incoming data under /mnt/field-demos/manufacturin
 #TODO: cleanup the silver table
 #Our bronze silver should have TORQUE with mostly NULL value and the _rescued column should be empty.
 #drop the TORQUE column, filter on _rescued to select only the rows without json error from the autoloader, filter on ID not null as you'll need it for your join later
+
 from pyspark.sql.functions import col
 
-silverDF = spark.readStream.table('turbine_bronze') ....
 #TODO: cleanup the data, make sure all IDs are not null and _rescued is null (if it's not null it means we couldn't parse the json with the infered schema).
+silverDF = (spark.readStream.table('turbine_bronze')
+                             .where((col("_rescued_data").isNull()) & (col("id").isNotNull()))
+                             .drop("torque"))
 
-silverDF.writeStream ...
 #TODO: write it back to your "turbine_silver" table
+(silverDF
+   .writeStream
+   .format("delta")
+   .option("checkpointLocation", path+"/silver_checkpoint")
+   .outputMode("append")
+   .table("flightschool_max_nethercott.turbine_silver")
+)
+
 
 # COMMAND ----------
 
 # MAGIC %sql
-# MAGIC -- TODO: run a SELECT from your turbine_silver table
+# MAGIC SELECT * from turbine_silver
 
 # COMMAND ----------
 
@@ -139,12 +186,22 @@ silverDF.writeStream ...
 
 #TODO: the turbine status is available under /mnt/field-demos/manufacturing/iot_turbine/status as parquet file
 # Use dbutils.fs to display the folder content
+display(dbutils.fs.ls("/mnt/field-demos/manufacturing/iot_turbine/status"))
 
 # COMMAND ----------
 
 #TODO:
 #Display the parquet available in folder content using standard spark read
-display(spark.read...)
+turbine_status_df = (
+  spark.read.parquet("/mnt/field-demos/manufacturing/iot_turbine/status")
+)
+display(turbine_status_df)
+
+# COMMAND ----------
+
+# MAGIC %sql
+# MAGIC 
+# MAGIC create table turbine_status as select * from parquet.`/mnt/field-demos/manufacturing/iot_turbine/status`
 
 # COMMAND ----------
 
@@ -152,7 +209,10 @@ display(spark.read...)
 # MAGIC --TODO: save the status data as our turbine_status table
 # MAGIC --Use databricks COPY INTO COMMAND https://docs.databricks.com/spark/latest/spark-sql/language-manual/delta-copy-into.html
 # MAGIC --Tips: as of DBR 10.3, schema inference isn't available with cloudfile reading parquet. If you chose to use autoloader instead of the COPY INTO command to load the status, you'll have to specify the schema. 
-# MAGIC COPY INTO turbine_status FROM ...
+# MAGIC 
+# MAGIC COPY INTO turbine_status
+# MAGIC   FROM '/mnt/field-demos/manufacturing/iot_turbine/status'
+# MAGIC   FILEFORMAT = parquet;
 
 # COMMAND ----------
 
@@ -161,7 +221,12 @@ turbine_stream = spark.readStream.table('turbine_silver')
 turbine_status = spark.read.table("turbine_status")
 
 #TODO: do a left join between turbine_stream and turbine_status on the 'id' key and save back the result as the "turbine_gold" table
-turbine_stream.join(....
+turbine_stream.join(turbine_status, turbine_stream.id == turbine_status.id, "left")
+   .writeStream
+   .format("delta")
+   .option("checkpointLocation", path+"/silver_checkpoint")
+   .outputMode("append")
+   .table("flightschool_max_nethercott.turbine_silver")
 
 # COMMAND ----------
 
